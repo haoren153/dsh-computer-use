@@ -78,6 +78,7 @@ namespace DshComputerUse
         [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, StringBuilder sb, int max);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hwnd, int index, int value);
@@ -1720,10 +1721,25 @@ namespace DshComputerUse
             return false;
         }
 
+        // Chromium builds its accessibility tree lazily. A standard AT request
+        // (WM_GETOBJECT/OBJID_CLIENT) wakes it; without this, apps such as
+        // VS Code expose only a few nodes even though the render host exists.
+        static void WakeAccessibility(IntPtr hwnd)
+        {
+            try
+            {
+                IntPtr result;
+                Native.SendMessageTimeout(hwnd, 0x003D /* WM_GETOBJECT */, IntPtr.Zero,
+                    new IntPtr(-4) /* OBJID_CLIENT */, 0x0002 /* SMTO_ABORTIFHUNG */, 1000, out result);
+            }
+            catch { }
+        }
+
         public static object Elements(Dictionary<string, object> r)
         {
             IntPtr hwnd = Args.Has(r, "hwnd") ? new IntPtr(Convert.ToInt64(r["hwnd"])) : Native.GetForegroundWindow();
             IntPtr root = ChromiumRoot(hwnd);
+            if (root != hwnd) WakeAccessibility(root);
             int max = Args.Int(r, "maxNodes", 150);
             bool all = Args.Bool(r, "includeText", false);
             bool popups = Args.Bool(r, "popups", false);
@@ -1743,7 +1759,9 @@ namespace DshComputerUse
                     if (popups || popupsOnly) foreach (var extra in Popups(hwnd))
                     {
                         if (result.Count >= max) break;
-                        try { result.AddRange(Collect(ChromiumRoot(extra), max - result.Count, all)); } catch (Exception) { }
+                        var popupRoot = ChromiumRoot(extra);
+                        if (popupRoot != extra) WakeAccessibility(popupRoot);
+                        try { result.AddRange(Collect(popupRoot, max - result.Count, all)); } catch (Exception) { }
                     }
                 }
                 catch (Exception ex) { error = ex; }

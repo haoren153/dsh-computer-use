@@ -77,6 +77,7 @@ namespace DshComputerUse
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hwnd, StringBuilder sb, int max);
         [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, StringBuilder sb, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hwnd, int index, int value);
@@ -1693,11 +1694,36 @@ namespace DshComputerUse
             ControlType.Button, ControlType.Edit, ControlType.Hyperlink, ControlType.MenuItem, ControlType.ListItem,
             ControlType.TabItem, ControlType.CheckBox, ControlType.RadioButton, ControlType.ComboBox, ControlType.TreeItem,
             ControlType.DataItem, ControlType.SplitButton, ControlType.Slider, ControlType.Spinner, ControlType.Document,
-            ControlType.MenuBar, ControlType.Menu, ControlType.ScrollBar };
+            ControlType.MenuBar, ControlType.Menu, ControlType.ScrollBar, ControlType.Group };
+
+        // Chromium/Electron 的顶层窗口只暴露 Pane，真正的 DOM 控件树在
+        // Chrome_RenderWidgetHostHWND 子窗口下。从顶层查会又慢又空。
+        static IntPtr ChromiumRoot(IntPtr hwnd)
+        {
+            try
+            {
+                var cls = new StringBuilder(256);
+                Native.GetClassName(hwnd, cls, cls.Capacity);
+                if (!cls.ToString().StartsWith("Chrome_WidgetWin", StringComparison.Ordinal)) return hwnd;
+                var render = Native.FindWindowEx(hwnd, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
+                return render != IntPtr.Zero ? render : hwnd;
+            }
+            catch { return hwnd; }
+        }
+
+        static bool IsEditorClass(string cls)
+        {
+            if (string.IsNullOrEmpty(cls)) return false;
+            string[] marks = { "ProseMirror", "tiptap", "CodeMirror", "monaco-editor", "ql-editor" };
+            foreach (var mark in marks)
+                if (cls.IndexOf(mark, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
 
         public static object Elements(Dictionary<string, object> r)
         {
             IntPtr hwnd = Args.Has(r, "hwnd") ? new IntPtr(Convert.ToInt64(r["hwnd"])) : Native.GetForegroundWindow();
+            IntPtr root = ChromiumRoot(hwnd);
             int max = Args.Int(r, "maxNodes", 150);
             bool all = Args.Bool(r, "includeText", false);
             bool popups = Args.Bool(r, "popups", false);
@@ -1710,14 +1736,14 @@ namespace DshComputerUse
                     if (popupsOnly) result = new List<object>();
                     else
                     {
-                        result = Collect(hwnd, max, all);
-                        if (result.Count < 4) { Thread.Sleep(400); result = Collect(hwnd, max, all); } // Chromium builds its tree lazily
+                        result = Collect(root, max, all);
+                        if (result.Count < 4) { Thread.Sleep(400); result = Collect(root, max, all); } // Chromium builds its tree lazily
                     }
                     // An open menu or flyout is a window of its own, not a descendant of the one it belongs to.
                     if (popups || popupsOnly) foreach (var extra in Popups(hwnd))
                     {
                         if (result.Count >= max) break;
-                        try { result.AddRange(Collect(extra, max - result.Count, all)); } catch (Exception) { }
+                        try { result.AddRange(Collect(ChromiumRoot(extra), max - result.Count, all)); } catch (Exception) { }
                     }
                 }
                 catch (Exception ex) { error = ex; }
@@ -1856,6 +1882,8 @@ namespace DshComputerUse
             cache.Add(AutomationElement.BoundingRectangleProperty);
             cache.Add(AutomationElement.IsEnabledProperty);
             cache.Add(AutomationElement.AutomationIdProperty);
+            cache.Add(AutomationElement.ClassNameProperty);
+            cache.Add(AutomationElement.IsKeyboardFocusableProperty);
             cache.Add(ValuePattern.ValueProperty);
             cache.Add(TogglePattern.ToggleStateProperty);
             cache.AutomationElementMode = AutomationElementMode.None;
@@ -1870,9 +1898,17 @@ namespace DshComputerUse
                 if (rect.IsEmpty || rect.Width < 2 || rect.Height < 2) continue;
                 var type = (ControlType)el.GetCachedPropertyValue(AutomationElement.ControlTypeProperty);
                 string name = (el.GetCachedPropertyValue(AutomationElement.NameProperty) as string) ?? "";
+                string cls = (el.GetCachedPropertyValue(AutomationElement.ClassNameProperty) as string) ?? "";
+                // Web 编辑器的 contenteditable 常是 Group（ProseMirror/tiptap 等），
+                // 不是 Edit；保留这类 Group，其余 Group 跳过，避免淹没按钮。
+                if (type == ControlType.Group && !IsEditorClass(cls)) continue;
                 var d = new Dictionary<string, object>();
-                d["role"] = type.ProgrammaticName.Replace("ControlType.", "");
+                d["role"] = type == ControlType.Group ? "TextInput" : type.ProgrammaticName.Replace("ControlType.", "");
+                if (type == ControlType.Group) d["editable"] = true;
                 d["name"] = name.Length > 120 ? name.Substring(0, 120) + "…" : name;
+                string aid = (el.GetCachedPropertyValue(AutomationElement.AutomationIdProperty) as string) ?? "";
+                if (aid.Length > 0) d["automationId"] = aid.Length > 120 ? aid.Substring(0, 120) + "…" : aid;
+                d["focusable"] = (bool)el.GetCachedPropertyValue(AutomationElement.IsKeyboardFocusableProperty);
                 object value = el.GetCachedPropertyValue(ValuePattern.ValueProperty, true);
                 if (value is string && ((string)value).Length > 0) { var v = (string)value; d["value"] = v.Length > 120 ? v.Substring(0, 120) + "…" : v; }
                 object toggle = el.GetCachedPropertyValue(TogglePattern.ToggleStateProperty, true);
